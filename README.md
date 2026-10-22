@@ -193,6 +193,9 @@ A：514 是传统 syslog 端口（TCP/UDP 均可），6514 是 syslog-over-TLS �
 **Q：服务器重启期间日志会丢吗？**
 A：重启时间短于队列耗尽时间则不丢——消息在内存排队，重连成功后自动补发；队列满（默认 4096 条）后才开始丢，可通过加大 `WithQueueSize` 缓解。
 
+**Q：用 `glog.Fatal` 退出时日志会丢吗？**
+A：会。`glog.Fatal` 打印后直接 `os.Exit(1)`，`defer w.Close()` 不会执行，队列中未发送的消息（包括这条 Fatal 本身）全部丢失。致命错误若需要可靠送达，先手动 `w.Close()` 再退出，或改用 `glog.Error` 并自行控制退出流程。
+
 **Q：怎么知道有没有在丢日志？**
 A：定期打印 `w.Stats()`，关注 `Dropped` 和 `Queued` 两个指标，`Queued` 持续上涨说明服务器消费不过来。
 
@@ -214,7 +217,10 @@ A：RFC 5424 的 MSG 是 UTF-8，本组件原样透传。若接收端显示乱�
 ├── tcplog_test.go           # 测试套件
 ├── example/main.go          # GoFrame 演示程序（HTTP :8199）
 ├── cmd/logrecv/main.go      # 独立的 syslog TCP 接收端（联调用）
+├── .github/workflows/               # release-please 自动发版 CI
+├── release-please-config.json       # release-please 配置
+├── .release-please-manifest.json    # 发版版本清单
 ├── go.mod / go.sum
-├── README.md
-└── .gitignore
+├── LICENSE
+└── README.md
 ```

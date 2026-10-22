@@ -28,6 +28,12 @@ import (
 // make 直接分配巨大缓冲的问题。
 const maxFrameLen = 1 << 20
 
+// maxLenPrefix 是帧长度前缀（"MSG-LEN SP"）的字节上限。合法的
+// MSG-LEN 至多十位数字（uint32 上限 4294967295），加空格共 11 字节，
+// 16 已留足余量；超过它仍未读到空格即可断定流已损坏，直接断开，
+// 不再为明显非法的帧继续耗费资源。
+const maxLenPrefix = 16
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:6514", "监听地址，host:port")
 	lfFraming := flag.Bool("lf", false, "使用 LF（非透明）帧，代替默认的八位组计数帧")
@@ -75,11 +81,21 @@ func readFrame(r *bufio.Reader, lf bool) (string, error) {
 		return strings.TrimRight(line, "\r\n"), err
 	}
 	// 八位组计数帧（RFC 6587）：MSG-LEN SP MSG。
-	lenStr, err := r.ReadString(' ')
+	//
+	// 长度前缀用 ReadSlice 而非 ReadString 读取：ReadString 在分隔符
+	// 迟迟不出现时会跨缓冲无限累积，损坏或恶意的流只要持续发送不含
+	// 空格的字节串就能把内存吃爆；ReadSlice 最多累积一个 bufio 缓冲
+	// （默认 4KB），缓冲耗尽即返回 ErrBufferFull，内存天然封顶。此外
+	// 合法前缀远小于 maxLenPrefix 字节，超限仍未出现空格即可断定
+	// 帧已损坏，直接断开连接。
+	lenStr, err := r.ReadSlice(' ')
 	if err != nil {
 		return "", err
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(lenStr))
+	if len(lenStr) > maxLenPrefix {
+		return "", fmt.Errorf("帧长度前缀超长（%d 字节）", len(lenStr))
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(lenStr)))
 	if err != nil || n < 0 || n > maxFrameLen {
 		return "", fmt.Errorf("非法的帧长度 %q", lenStr)
 	}

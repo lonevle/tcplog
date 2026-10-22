@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -32,6 +33,11 @@ type receiver struct {
 // WhenQueueFull），1MB 上限远高于此。
 const maxFrameLen = 1 << 20
 
+// maxLenPrefix 限制帧长度前缀的字节数，与 cmd/logrecv 的防御保持
+// 一致（详见 cmd/logrecv/main.go 中 readFrame 的注释）：超长前缀
+// 直接断开，防止损坏流耗尽内存。
+const maxLenPrefix = 16
+
 func startReceiver(t *testing.T) *receiver {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -56,11 +62,17 @@ func (r *receiver) serve(conn net.Conn) {
 	defer conn.Close()
 	br := bufio.NewReader(conn)
 	for {
-		lenStr, err := br.ReadString(' ')
+		// 长度前缀用 ReadSlice（而非 ReadString）读取：前缀最多累积
+		// 一个 bufio 缓冲，且超过 maxLenPrefix 字节即断定损坏断开，
+		// 防御方式与 cmd/logrecv 的 readFrame 保持一致。
+		lenStr, err := br.ReadSlice(' ')
 		if err != nil {
 			return
 		}
-		n, err := strconv.Atoi(strings.TrimSpace(lenStr))
+		if len(lenStr) > maxLenPrefix {
+			return
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(string(lenStr)))
 		if err != nil || n < 0 || n > maxFrameLen {
 			return
 		}
@@ -203,12 +215,24 @@ func TestFrame(t *testing.T) {
 	if got, want := string(lf.frame([]byte("abc"))), "abc\n"; got != want {
 		t.Errorf("LF 帧: 得到 %q，期望 %q", got, want)
 	}
-	// 输入缓冲必须被复制，不能被引用。
-	src := []byte("abc")
-	octet.frame(src)
+	// 输入缓冲必须被复制，不能被引用：保留第一次加帧的结果，篡改
+	// src 的底层数组后，已生成的帧不得随之变化。刻意用 make 留出富余
+	// 容量——“不复制”最自然的变异实现 return append(p, '\n') 只在
+	// cap 富余时才会复用输入的底层数组；cap==len 时 append 反而重新
+	// 分配，恰好掩盖共享问题。
+	src := make([]byte, 3, 16)
+	copy(src, "abc")
+	framed := octet.frame(src)
 	src[0] = 'z'
-	if got := string(octet.frame(src)); got != "3 zbc" {
-		t.Errorf("加帧时必须复制输入: %q", got)
+	if got := string(framed); got != "3 abc" {
+		t.Errorf("八位组计数帧必须复制输入: %q", got)
+	}
+	lfSrc := make([]byte, 3, 16)
+	copy(lfSrc, "abc")
+	lfFramed := lf.frame(lfSrc)
+	lfSrc[0] = 'z'
+	if got := string(lfFramed); got != "abc\n" {
+		t.Errorf("LF 帧必须复制输入: %q", got)
 	}
 }
 
@@ -514,6 +538,45 @@ func TestReceiverRejectsOversizedFrame(t *testing.T) {
 	case f := <-r.frames:
 		t.Fatalf("超限帧不应产生消息，却收到: %q", f)
 	default:
+	}
+}
+
+// TestReceiverRejectsOverlongLenPrefix 验证接收端对“超长帧长度前缀”
+// 的防御：ReadString 读前缀时会在分隔符迟迟不出现的情况下跨缓冲无限
+// 累积（恶意流只要持续发送不含空格的字节串即可耗尽内存）；改用
+// ReadSlice 后前缀最多累积一个 bufio 缓冲，且超过 maxLenPrefix 字节
+// 即断定帧损坏、断开连接。
+func TestReceiverRejectsOverlongLenPrefix(t *testing.T) {
+	r := startReceiver(t)
+	for name, payload := range map[string][]byte{
+		// 100 字节数字后跟空格：前缀超过 16 字节上限，命中显式检查。
+		"超限后遇空格": []byte(strings.Repeat("1", 100) + " "),
+		// 5000 字节且始终无空格：耗尽 bufio 缓冲（ErrBufferFull 路径）。
+		"超长无空格": []byte(strings.Repeat("1", 5000)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn, err := net.Dial("tcp", r.addr())
+			if err != nil {
+				t.Fatalf("拨号失败: %v", err)
+			}
+			defer conn.Close()
+			if _, err := conn.Write(payload); err != nil {
+				t.Fatalf("写入失败: %v", err)
+			}
+			// 接收端应当断开连接：读到 EOF 或连接错误。若到读超时
+			// 仍未断开，说明防御失效。
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			buf := make([]byte, 16)
+			if _, err := conn.Read(buf); errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("接收端未在超时内断开连接: %v", err)
+			}
+			// 不应当有任何帧被投递出来。
+			select {
+			case f := <-r.frames:
+				t.Fatalf("超长前缀不应产生消息，却收到: %q", f)
+			default:
+			}
+		})
 	}
 }
 
