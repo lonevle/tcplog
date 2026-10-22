@@ -313,13 +313,13 @@ func TestWriterLazyConnectAndBackoff(t *testing.T) {
 	}
 	defer w.Close()
 
-	// 第一条消息会被丢弃：没有服务端，拨号必然失败。
-	if _, err := w.Write([]byte("lost message")); err != nil {
+	// 服务器不可达：消息应留队缓冲，等待重连成功后补发。
+	if _, err := w.Write([]byte("buffered message")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	// 在同一端口把服务端拉起来，Writer 必须能自动重连。
+	// 在同一端口把服务端拉起来，Writer 必须能自动重连并补发积压消息。
 	r := &receiver{frames: make(chan string, 8)}
 	ln2, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -340,11 +340,14 @@ func TestWriterLazyConnectAndBackoff(t *testing.T) {
 	if _, err := w.Write([]byte("recovered message")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	got := r.next(t, 3*time.Second)
-	if got != "recovered message" {
+	// 队列 FIFO：宕机期间缓冲的消息先被补发，随后是新消息。
+	if got := r.next(t, 3*time.Second); got != "buffered message" {
+		t.Fatalf("补发消息不符合预期: %q", got)
+	}
+	if got := r.next(t, 3*time.Second); got != "recovered message" {
 		t.Fatalf("帧不符合预期: %q", got)
 	}
-	if stats := w.Stats(); stats.Sent < 1 || stats.Dropped < 1 {
+	if stats := w.Stats(); stats.Sent != 2 || stats.Dropped != 0 {
 		t.Fatalf("计数不符合预期: %+v", stats)
 	}
 }
@@ -540,9 +543,10 @@ func TestBatchFlushOnClose(t *testing.T) {
 	}
 }
 
-// TestBatchDroppedWhenServerDown 验证批处理模式下服务器不可达时，整批
-// 丢弃按消息条数计数。
-func TestBatchDroppedWhenServerDown(t *testing.T) {
+// TestBatchBufferedWhenServerDown 验证批处理模式下服务器不可达时，消息
+// 留在队列中缓冲而不是被立即丢弃；Close 的关机路径不做重连等待，尽力
+// 一次失败后才整批计入丢弃。
+func TestBatchBufferedWhenServerDown(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("监听失败: %v", err)
@@ -561,13 +565,24 @@ func TestBatchDroppedWhenServerDown(t *testing.T) {
 	defer w.Close()
 
 	for i := 0; i < 3; i++ {
-		if _, err := w.Write([]byte("lost batch")); err != nil {
+		if _, err := w.Write([]byte("buffered batch")); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for w.Stats().Dropped < 3 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	// 覆盖若干轮退避重试，期间消息必须留在队列中，不产生任何丢弃。
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if stats := w.Stats(); stats.Dropped != 0 {
+			t.Fatalf("服务器不可达时消息应留队缓冲，却被丢弃: %+v", stats)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if stats := w.Stats(); stats.Queued != 3 {
+		t.Fatalf("消息应留在队列中缓冲: %+v", stats)
+	}
+	// Close 尽力一次：连接不可用则整批计入丢弃。
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 	if stats := w.Stats(); stats.Dropped != 3 || stats.Sent != 0 {
 		t.Fatalf("计数不符合预期: %+v", stats)

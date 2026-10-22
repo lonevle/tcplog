@@ -30,7 +30,8 @@ type Stats struct {
 	// Sent 是成功写入 socket 的消息条数。
 	Sent uint64
 
-	// Dropped 是被丢弃的消息条数：连接不可用（重试后仍失败）或队列已满。
+	// Dropped 是被丢弃的消息条数：队列已满、写入 socket 失败，或
+	// Close 时连接不可用而放弃的消息。
 	Dropped uint64
 
 	// Queued 是当前积压在内存队列中的消息条数。
@@ -42,9 +43,10 @@ type Stats struct {
 //
 // Writer 可并发使用，且实现了 io.Writer：每次 Write 调用视为一条完整
 // 的 syslog 消息（通常是 Formatter.Format 的输出）。投递是异步的——
-// Write 只把加帧后的消息放入队列，由后台 goroutine 维护 TCP 连接；
-// 服务器不可达时按指数退避重连。宕机期间队列溢出会丢包并计数，
-// 可通过 Stats 观测。
+// Write 只把加帧后的消息放入队列，由后台 goroutine 维护 TCP 连接。
+// 服务器不可达时按指数退避重连，期间消息在队列中缓冲，重连成功后
+// 自动补发；仅当队列溢出，或单条消息写入 socket 失败（帧边界已破坏）
+// 时才会丢包并计数，可通过 Stats 观测。
 //
 // 默认逐条立即发送；也可用 WithBatchSize / WithBatchInterval 开启批
 // 处理，把多条消息合并为一次 socket 写入（代价是投递延迟最多增加
@@ -274,6 +276,9 @@ func (w *Writer) frame(p []byte) []byte {
 // run 是发送 goroutine：持续消费队列并维护 TCP 连接。未启用批处理时
 // 走逐条发送路径；启用了 WithBatchSize / WithBatchInterval 任一选项时
 // 走批处理路径。
+//
+// 连接未就绪时 run 不会从队列取消息，而是先阻塞在 ensureConnected 上
+// 等待重连成功，让消息在队列中缓冲，服务器恢复后自动补发。
 func (w *Writer) run() {
 	defer close(w.doneCh)
 	if w.batchSize > 1 || w.batchInterval > 0 {
@@ -281,27 +286,65 @@ func (w *Writer) run() {
 		return
 	}
 	for {
+		// 先确保连接可用再消费队列：服务器不可达期间消息留队缓冲，
+		// 由 Write 端按队列容量决定是否丢弃。stopCh 关闭则转入关机清理。
+		if !w.ensureConnected() {
+			w.drain()
+			return
+		}
 		select {
 		case msg := <-w.queue:
 			w.deliver(msg)
 		case <-w.stopCh:
-			// 尽力把队列里剩余的消息全部发出。
-			for {
-				select {
-				case msg := <-w.queue:
-					w.deliver(msg)
-				default:
-					w.closeConn()
-					return
-				}
-			}
+			w.drain()
+			return
 		}
 	}
 }
 
-// runBatched 是批处理模式下的发送循环：消息在批内累积，满足条数
-// （WithBatchSize）或时间（WithBatchInterval）条件即合并为一次写入。
-// 合并只影响 socket 写入方式，帧格式不变，接收端仍逐条解析。
+// drain 是关机路径：把队列里剩余的消息尽力发出。连接可用则逐条发送；
+// 不可用则不做重连等待，直接丢弃（deliver 内的退避窗口检查会命中），
+// 保证 Close 快速返回。
+// 只允许 run goroutine 调用。
+func (w *Writer) drain() {
+	for {
+		select {
+		case msg := <-w.queue:
+			w.deliver(msg)
+		default:
+			w.closeConn()
+			return
+		}
+	}
+}
+
+// ensureConnected 阻塞到 TCP 连接可用为止：处于退避窗口时先等窗口到期，
+// 拨号失败则按指数退避继续重试。期间不消费队列，消息得以在队列中缓冲、
+// 服务器恢复后自动补发。stopCh 关闭后返回 false（不再等待、也不再拨号）。
+// 只允许 run goroutine 调用。
+func (w *Writer) ensureConnected() bool {
+	for w.conn == nil {
+		if d := time.Until(w.nextDial); d > 0 {
+			select {
+			case <-time.After(d):
+			case <-w.stopCh:
+				return false
+			}
+			continue
+		}
+		if err := w.ensureConn(); err != nil {
+			w.emitError(err)
+			w.scheduleBackoff()
+			continue
+		}
+	}
+	return true
+}
+
+// runBatched 是批处理模式下的发送循环：连接未就绪时先等待重连（消息
+// 留在队列缓冲），连接就绪后消息在批内累积，满足条数（WithBatchSize）
+// 或时间（WithBatchInterval）条件即合并为一次写入。合并只影响 socket
+// 写入方式，帧格式不变，接收端仍逐条解析。
 func (w *Writer) runBatched() {
 	var (
 		batch  [][]byte
@@ -331,7 +374,30 @@ func (w *Writer) runBatched() {
 		batch = batch[:0]
 		stopTimer()
 	}
+	// drainBatched 是关机路径：把队列里剩余的消息尽量按批发完，最后
+	// flush 兜底。与逐条模式的 drain 相同，不做重连等待，发不出去的
+	// 随批次计入丢弃，保证 Close 快速返回。
+	drainBatched := func() {
+		for {
+			select {
+			case msg := <-w.queue:
+				batch = append(batch, msg)
+				if w.batchSize > 1 && len(batch) >= w.batchSize {
+					flush()
+				}
+			default:
+				flush()
+				w.closeConn()
+				return
+			}
+		}
+	}
 	for {
+		// 先确保连接可用再消费队列：服务器不可达期间消息留队缓冲。
+		if !w.ensureConnected() {
+			drainBatched()
+			return
+		}
 		select {
 		case msg := <-w.queue:
 			batch = append(batch, msg)
@@ -345,26 +411,16 @@ func (w *Writer) runBatched() {
 		case <-timerC:
 			flush()
 		case <-w.stopCh:
-			// 关机：把队列里剩余的消息尽量按批发完，最后 flush 兜底。
-			for {
-				select {
-				case msg := <-w.queue:
-					batch = append(batch, msg)
-					if w.batchSize > 1 && len(batch) >= w.batchSize {
-						flush()
-					}
-				default:
-					flush()
-					w.closeConn()
-					return
-				}
-			}
+			drainBatched()
+			return
 		}
 	}
 }
 
-// deliver 发送一条加帧后的消息，连接断开时会先重连再重试一次。
-// 只允许 run goroutine 调用。
+// deliver 发送一条加帧后的消息。正常路径下连接已由 ensureConnected 保障
+// 就绪；写入失败视为连接级故障，丢弃该消息并触发重连退避（TCP 流一旦
+// 部分写入，帧边界即被破坏，无法安全重发）。关机 drain 路径下连接不可用
+// 时不做重连等待，直接丢弃。只允许 run goroutine 调用。
 func (w *Writer) deliver(msg []byte) {
 	if w.conn == nil && time.Now().Before(w.nextDial) {
 		// 仍处于重连退避窗口内：直接丢弃，避免频繁拨号冲击服务器。
@@ -391,7 +447,8 @@ func (w *Writer) deliver(msg []byte) {
 // deliverBatch 把一批加帧后的消息合并为一次 socket 写入，减少 write
 // 系统调用与 TCP 段数量。合并缓冲区的上限约为 条数 × 单条大小，由
 // WithBatchSize 的使用方自行评估内存。整批的投递结果按每条消息计数
-// （成功/丢弃都是 len(msgs) 条）。只允许 run goroutine 调用。
+// （成功/丢弃都是 len(msgs) 条）。与 deliver 相同：正常路径连接已就绪，
+// 关机 drain 路径下连接不可用时整批直接丢弃。只允许 run goroutine 调用。
 func (w *Writer) deliverBatch(msgs [][]byte) {
 	if len(msgs) == 0 {
 		return
