@@ -71,7 +71,8 @@ type Record struct {
 	// Severity 是 syslog 严重级别，取值 0（Emergency）到 7（Debug）。
 	Severity int
 
-	// MsgID 标识消息类型，例如 "INFO"；为空或含空格时渲染为 NILVALUE。
+	// MsgID 标识消息类型，例如 "INFO"；为空、含空白或含非 ASCII 字符
+	// 时渲染为 NILVALUE。
 	MsgID string
 
 	// Msg 是自由格式的日志内容（UTF-8）。使用八位组计数帧时允许包含
@@ -115,13 +116,16 @@ func (sd SDElement) String() string {
 // 静态的 HEADER 字段。一般直接用 DefaultFormatter 取默认值，也可以
 // 手动填充结构体。
 type Formatter struct {
-	// Hostname 对应 HOSTNAME 字段；为空时渲染为 NILVALUE。
+	// Hostname 对应 HOSTNAME 字段；为空、含空白或含非 ASCII 字符时
+	// 渲染为 NILVALUE。
 	Hostname string
 
-	// AppName 对应 APP-NAME 字段；为空时渲染为 NILVALUE。
+	// AppName 对应 APP-NAME 字段；为空、含空白或含非 ASCII 字符时
+	// 渲染为 NILVALUE。
 	AppName string
 
-	// ProcID 对应 PROCID 字段；为空时渲染为 NILVALUE。
+	// ProcID 对应 PROCID 字段；为空、含空白或含非 ASCII 字符时
+	// 渲染为 NILVALUE。
 	ProcID string
 
 	// Facility 是 syslog 设备类型，取值 0-23，超出范围会被截断到边界值。
@@ -196,11 +200,21 @@ func formatTimestamp(t time.Time) string {
 	return t.Format("2006-01-02T15:04:05.000000-07:00")
 }
 
-// headerValue 清洗 HEADER 字段：按 RFC 5424 要求这些字段不允许出现
-// 空格，因此空值或含空白的值一律替换为 NILVALUE。
+// headerValue 清洗 HEADER 字段：RFC 5424 要求 HOSTNAME / APP-NAME /
+// PROCID / MSGID 只能由不含空格的可打印 US-ASCII（0x21-0x7E）组成。
+// 因此空值，或含空白及其他控制字符、DEL、任何非 ASCII 字节（例如中文
+// 主机名的 UTF-8 编码）的值，一律整体替换为 NILVALUE，避免产出会被
+// 严格接收端拒收的非法帧。
 func headerValue(s string) string {
-	if s == "" || strings.ContainsAny(s, " \t\r\n") {
+	if s == "" {
 		return NilValue
+	}
+	for i := 0; i < len(s); i++ {
+		// c <= 0x20 覆盖空格与所有控制字符（含 \t\r\n），
+		// c >= 0x7F 覆盖 DEL 以及 UTF-8 多字节序列的所有字节。
+		if c := s[i]; c <= 0x20 || c >= 0x7F {
+			return NilValue
+		}
 	}
 	return s
 }

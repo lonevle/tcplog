@@ -138,6 +138,21 @@ func TestFormatHeaderValueSanitization(t *testing.T) {
 	}
 }
 
+func TestFormatHeaderRejectsNonASCII(t *testing.T) {
+	f := &Formatter{Hostname: "中文主机名", AppName: "app", ProcID: "1", Facility: FacilityLocal0}
+	got := string(f.Format(&Record{
+		Time:     time.Now(),
+		Severity: SeverityInformational,
+		MsgID:    "MSG ID", // 含空格
+		Msg:      "x",
+	}))
+	// RFC 5424 要求 HEADER 字段为可打印 US-ASCII：非 ASCII 的 HOSTNAME
+	// 与含空格的 MSGID 都必须渲染为 NILVALUE。
+	if !strings.Contains(got, " - app 1 - - x") {
+		t.Fatalf("头部字段未按预期清洗: %q", got)
+	}
+}
+
 func TestSeverityFromGlogLevel(t *testing.T) {
 	cases := []struct {
 		level    int
@@ -187,6 +202,37 @@ func TestNewInvalidAddr(t *testing.T) {
 	}
 	if _, err := New(""); err == nil {
 		t.Fatal("空地址应当报错")
+	}
+}
+
+// TestWithBackoffValidation 验证退避参数的边界处理：max 非法（非正或
+// 小于最终生效的 min）时必须兜底提升到 min，保证 minBackoff <=
+// maxBackoff 恒成立——否则 scheduleBackoff 的指数增长永远不触发，
+// 退避被卡死在 min 上，且用户配置的上限被静默丢弃。
+func TestWithBackoffValidation(t *testing.T) {
+	cases := []struct {
+		name             string
+		min, max         time.Duration
+		wantMin, wantMax time.Duration
+	}{
+		{"max为零", 30 * time.Second, 0, 30 * time.Second, 30 * time.Second},
+		{"max为负", 30 * time.Second, -time.Second, 30 * time.Second, 30 * time.Second},
+		{"max小于min", 10 * time.Second, 5 * time.Second, 10 * time.Second, 10 * time.Second},
+		{"max小于默认min", 0, 100 * time.Millisecond, defaultMinBackoff, defaultMinBackoff},
+		{"正常区间", 100 * time.Millisecond, 5 * time.Second, 100 * time.Millisecond, 5 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w, err := New("127.0.0.1:1", WithBackoff(c.min, c.max))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer w.Close()
+			if w.minBackoff != c.wantMin || w.maxBackoff != c.wantMax {
+				t.Fatalf("退避参数不符: 得到 min=%v max=%v, 期望 min=%v max=%v",
+					w.minBackoff, w.maxBackoff, c.wantMin, c.wantMax)
+			}
+		})
 	}
 }
 

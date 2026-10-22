@@ -14,6 +14,7 @@
 package main
 
 import (
+	"log"
 	"os"
 
 	"github.com/gogf/gf/v2/frame/g"
@@ -40,8 +41,12 @@ func main() {
 	w, err := tcplog.New(syslogAddr,
 		tcplog.WithQueueSize(8192),
 		tcplog.WithErrorHandler(func(err error) {
-			// 这里可以接入监控打点，注意不要阻塞。
-			glog.Debug(ctx, "syslog 传输错误:", err)
+			// 这里可以接入监控打点，注意不要阻塞。刻意用标准库 log
+			// 而不是 glog：glog 已被下面的 handler 路由到同一个 syslog
+			// Writer，若在这里用 glog 记录传输错误，服务器宕机期间会
+			// 形成自我反馈回路——每轮拨号失败都自产一条 debug 日志
+			// 入队，挤占队列、挤掉真正的业务日志。
+			log.Printf("syslog 传输错误: %v", err)
 		}),
 	)
 	if err != nil {

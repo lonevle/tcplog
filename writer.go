@@ -120,8 +120,14 @@ func WithWriteTimeout(d time.Duration) Option {
 	}
 }
 
-// WithBackoff 设置重连退避区间。连接失败后，下一次拨号会延迟 [min, max]
-// 之间的随机时长，连续失败时指数增长直到 max。默认 200ms / 10s。
+// WithBackoff 设置重连退避区间。连接失败后，下一次拨号会推迟当前退避值
+// 加 [0, min) 的随机抖动；退避值从 min 开始，连续失败时指数翻倍直到
+// max。默认 200ms / 10s。
+//
+// 若 max 非正、或小于最终生效的 min，则把 max 兜底提升为 min，保证
+// minBackoff <= maxBackoff 恒成立——否则 scheduleBackoff 里的指数增长
+// 会因为 backoff >= max 永远不触发，退避被卡死在 min 上，且用户配置
+// 的上限被静默丢弃。
 func WithBackoff(min, max time.Duration) Option {
 	return func(w *Writer) {
 		if min > 0 {
@@ -129,6 +135,10 @@ func WithBackoff(min, max time.Duration) Option {
 		}
 		if max >= w.minBackoff {
 			w.maxBackoff = max
+		} else {
+			// max 非法（非正，或小于最终 min）：兜底提升到 min，
+			// 维持 minBackoff <= maxBackoff 不变式。
+			w.maxBackoff = w.minBackoff
 		}
 	}
 }
@@ -303,8 +313,9 @@ func (w *Writer) run() {
 }
 
 // drain 是关机路径：把队列里剩余的消息尽力发出。连接可用则逐条发送；
-// 不可用则不做重连等待，直接丢弃（deliver 内的退避窗口检查会命中），
-// 保证 Close 快速返回。
+// 不可用且处于退避窗口时直接丢弃（deliver 内的检查会命中）。不在退避
+// 窗口时 deliver 仍会尝试一次拨号，因此 Close 最坏可能阻塞一个拨号
+// 超时（见 WithDialTimeout），这是“尽力发完”语义的代价。
 // 只允许 run goroutine 调用。
 func (w *Writer) drain() {
 	for {
@@ -325,9 +336,13 @@ func (w *Writer) drain() {
 func (w *Writer) ensureConnected() bool {
 	for w.conn == nil {
 		if d := time.Until(w.nextDial); d > 0 {
+			// 用 NewTimer 并在退出路径显式 Stop，而不是每次循环
+			// time.After 新建：避免高频退避期间累积未到期的 timer。
+			t := time.NewTimer(d)
 			select {
-			case <-time.After(d):
+			case <-t.C:
 			case <-w.stopCh:
+				t.Stop()
 				return false
 			}
 			continue
@@ -419,8 +434,9 @@ func (w *Writer) runBatched() {
 
 // deliver 发送一条加帧后的消息。正常路径下连接已由 ensureConnected 保障
 // 就绪；写入失败视为连接级故障，丢弃该消息并触发重连退避（TCP 流一旦
-// 部分写入，帧边界即被破坏，无法安全重发）。关机 drain 路径下连接不可用
-// 时不做重连等待，直接丢弃。只允许 run goroutine 调用。
+// 部分写入，帧边界即被破坏，无法安全重发）。关机 drain 路径下，若处于
+// 退避窗口则直接丢弃，否则仍会尝试一次拨号（见 drain 的注释）。
+// 只允许 run goroutine 调用。
 func (w *Writer) deliver(msg []byte) {
 	if w.conn == nil && time.Now().Before(w.nextDial) {
 		// 仍处于重连退避窗口内：直接丢弃，避免频繁拨号冲击服务器。
@@ -448,7 +464,7 @@ func (w *Writer) deliver(msg []byte) {
 // 系统调用与 TCP 段数量。合并缓冲区的上限约为 条数 × 单条大小，由
 // WithBatchSize 的使用方自行评估内存。整批的投递结果按每条消息计数
 // （成功/丢弃都是 len(msgs) 条）。与 deliver 相同：正常路径连接已就绪，
-// 关机 drain 路径下连接不可用时整批直接丢弃。只允许 run goroutine 调用。
+// 关机 drain 路径下若处于退避窗口则整批丢弃。只允许 run goroutine 调用。
 func (w *Writer) deliverBatch(msgs [][]byte) {
 	if len(msgs) == 0 {
 		return
@@ -525,7 +541,9 @@ func (w *Writer) closeConn() {
 	}
 }
 
-// scheduleBackoff 在连接失败后推迟下一次拨号。
+// scheduleBackoff 在连接失败后推迟下一次拨号：等待时长为当前退避值加
+// [0, min) 的随机抖动，避免多实例同时重连造成惊群。退避值从 min 起
+// 指数翻倍、封顶 max；任何一次投递成功后清零（见 deliver/deliverBatch）。
 func (w *Writer) scheduleBackoff() {
 	switch {
 	case w.backoff == 0:
