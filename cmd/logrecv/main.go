@@ -21,6 +21,13 @@ import (
 	"sync/atomic"
 )
 
+// maxFrameLen 是单条 syslog 帧负载的长度上限。RFC 6587 本身未规定
+// 上限，但主流实现都会限制（syslog-ng 默认 8KB，rsyslog 的
+// $MaxMessageSize 默认 64KB）；这里取 1MB——宽松到足以容纳任何合理
+// 日志，又能挡住损坏或恶意帧声明超大长度（例如 n=1073741824）导致
+// make 直接分配巨大缓冲的问题。
+const maxFrameLen = 1 << 20
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:6514", "监听地址，host:port")
 	lfFraming := flag.Bool("lf", false, "使用 LF（非透明）帧，代替默认的八位组计数帧")
@@ -73,7 +80,7 @@ func readFrame(r *bufio.Reader, lf bool) (string, error) {
 		return "", err
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(lenStr))
-	if err != nil || n < 0 {
+	if err != nil || n < 0 || n > maxFrameLen {
 		return "", fmt.Errorf("非法的帧长度 %q", lenStr)
 	}
 	buf := make([]byte, n)

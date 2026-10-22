@@ -26,6 +26,12 @@ type receiver struct {
 	frames   chan string
 }
 
+// maxFrameLen 限制测试接收端接受的单帧负载长度，与 cmd/logrecv 的
+// 防御保持一致：损坏帧声明超大长度（例如 1GB）时直接断开，而不是
+// make 出巨大缓冲。测试中最大的合法消息是 64KB（TestWriterDrops-
+// WhenQueueFull），1MB 上限远高于此。
+const maxFrameLen = 1 << 20
+
 func startReceiver(t *testing.T) *receiver {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -55,7 +61,7 @@ func (r *receiver) serve(conn net.Conn) {
 			return
 		}
 		n, err := strconv.Atoi(strings.TrimSpace(lenStr))
-		if err != nil || n < 0 {
+		if err != nil || n < 0 || n > maxFrameLen {
 			return
 		}
 		buf := make([]byte, n)
@@ -126,6 +132,16 @@ func TestFormatStructuredDataEscaping(t *testing.T) {
 	want := `[gf note="a\"b\\c\]d"]`
 	if got := sd.String(); got != want {
 		t.Fatalf("结构化数据转义不符:\n 实际: %q\n 期望: %q", got, want)
+	}
+}
+
+// TestSDElementEmptyNames 验证空 SD-ID 与空 SD-PARAM-NAME 的兜底命名
+// 语义正确：SD-ID 是元素名应兜底为 "elem"，参数名才兜底为 "param"
+// ——之前两者共用 "param"，空 ID 的元素名会被误导性地渲染成 "param"。
+func TestSDElementEmptyNames(t *testing.T) {
+	sd := SDElement{Params: []SDParam{{Key: "", Value: "v"}}}
+	if got, want := sd.String(), `[elem param="v"]`; got != want {
+		t.Fatalf("空名兜底不符:\n 实际: %q\n 期望: %q", got, want)
 	}
 }
 
@@ -321,6 +337,11 @@ func TestGlogHandlerIntegration(t *testing.T) {
 	defer w.Close()
 
 	f := &Formatter{Hostname: "testhost", AppName: "testapp", ProcID: "999", Facility: FacilityLocal0}
+	// 保存并还原全局默认 handler：glog.SetDefaultHandler 改的是包级
+	// 全局状态，不还原会泄漏到后续测试——未来新增依赖 glog 默认行为
+	// 的测试会意外把日志发往本测试的 TCP receiver。
+	oldHandler := glog.GetDefaultHandler()
+	t.Cleanup(func() { glog.SetDefaultHandler(oldHandler) })
 	glog.SetDefaultHandler(NewGlogHandler(w, f))
 
 	ctx := gctx.New()
@@ -462,6 +483,37 @@ func TestWriterDropsWhenQueueFull(t *testing.T) {
 	}
 	if w.Stats().Dropped == 0 {
 		t.Fatal("队列溢出时应当出现丢包")
+	}
+}
+
+// TestReceiverRejectsOversizedFrame 验证接收端对损坏/恶意帧的防御：
+// 帧长度声明超过 maxFrameLen 时必须直接断开连接，而不是按声明值
+// make 巨大缓冲（例如 n=1073741824 会立刻分配 1GB）。
+func TestReceiverRejectsOversizedFrame(t *testing.T) {
+	r := startReceiver(t)
+	conn, err := net.Dial("tcp", r.addr())
+	if err != nil {
+		t.Fatalf("拨号失败: %v", err)
+	}
+	defer conn.Close()
+
+	// 声明一条 1GB 的帧并只发送长度前缀。
+	if _, err := conn.Write([]byte("1073741824 ")); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	// 接收端识别出超限长度后应关闭连接：读到 EOF（带超时兜底）。
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 16)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			break // EOF 或连接错误都表示已断开
+		}
+	}
+	// 不应当有任何帧被投递出来。
+	select {
+	case f := <-r.frames:
+		t.Fatalf("超限帧不应产生消息，却收到: %q", f)
+	default:
 	}
 }
 

@@ -121,8 +121,8 @@ func WithWriteTimeout(d time.Duration) Option {
 }
 
 // WithBackoff 设置重连退避区间。连接失败后，下一次拨号会推迟当前退避值
-// 加 [0, min) 的随机抖动；退避值从 min 开始，连续失败时指数翻倍直到
-// max。默认 200ms / 10s。
+// 加 [0, min] 的随机抖动（闭区间，见 scheduleBackoff）；退避值从 min
+// 开始，连续失败时指数翻倍直到 max。默认 200ms / 10s。
 //
 // 若 max 非正、或小于最终生效的 min，则把 max 兜底提升为 min，保证
 // minBackoff <= maxBackoff 恒成立——否则 scheduleBackoff 里的指数增长
@@ -542,7 +542,7 @@ func (w *Writer) closeConn() {
 }
 
 // scheduleBackoff 在连接失败后推迟下一次拨号：等待时长为当前退避值加
-// [0, min) 的随机抖动，避免多实例同时重连造成惊群。退避值从 min 起
+// [0, min] 的随机抖动，避免多实例同时重连造成惊群。退避值从 min 起
 // 指数翻倍、封顶 max；任何一次投递成功后清零（见 deliver/deliverBatch）。
 func (w *Writer) scheduleBackoff() {
 	switch {
@@ -554,7 +554,8 @@ func (w *Writer) scheduleBackoff() {
 			w.backoff = w.maxBackoff
 		}
 	}
-	// 加抖动，避免多实例同时重连造成惊群。
+	// 加抖动，避免多实例同时重连造成惊群。rand.Int64N(n) 返回 [0, n)，
+	// 传入 min+1 即得 [0, min]（整数闭区间）。
 	jitter := time.Duration(rand.Int64N(int64(w.minBackoff) + 1))
 	w.nextDial = time.Now().Add(w.backoff + jitter)
 }

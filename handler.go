@@ -91,7 +91,7 @@ func NewGlogHandler(w io.Writer, formatter *Formatter) glog.Handler {
 
 // Setup 是 New + NewGlogHandler 的便捷封装：为 addr 创建 Writer 并注册
 // 为 glog 默认 handler，这样所有 GoFrame 日志都会发往 syslog 服务器。
-// 关闭时调用返回 writer 的 Close 以flush 剩余消息。
+// 关闭时调用返回 writer 的 Close 以 flush 剩余消息。
 //
 // formatter 传 nil 时使用 DefaultFormatter。
 func Setup(addr string, formatter *Formatter, opts ...Option) (*Writer, error) {

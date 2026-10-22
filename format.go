@@ -100,10 +100,10 @@ type SDElement struct {
 func (sd SDElement) String() string {
 	var buf strings.Builder
 	buf.WriteByte('[')
-	buf.WriteString(sanitizeSDName(sd.ID))
+	buf.WriteString(sanitizeSDName(sd.ID, "elem"))
 	for _, p := range sd.Params {
 		buf.WriteByte(' ')
-		buf.WriteString(sanitizeSDName(p.Key))
+		buf.WriteString(sanitizeSDName(p.Key, "param"))
 		buf.WriteString(`="`)
 		buf.WriteString(escapeSDValue(p.Value))
 		buf.WriteByte('"')
@@ -221,9 +221,11 @@ func headerValue(s string) string {
 
 // sanitizeSDName 清洗 SD-ID 与 SD-PARAM-NAME：只允许除 '='、空格、']'、
 // '"' 之外的可打印 ASCII（RFC 5424 第 6.3 节），非法字符替换为 '_'。
-func sanitizeSDName(s string) string {
+// 空值替换为 fallback——RFC 要求两者非空且语义不同：SD-ID 是元素名，
+// 传 "elem"；SD-PARAM-NAME 是参数名，传 "param"。
+func sanitizeSDName(s, fallback string) string {
 	if s == "" {
-		return "param"
+		return fallback
 	}
 	var sb strings.Builder
 	sb.Grow(len(s))
@@ -238,14 +240,19 @@ func sanitizeSDName(s string) string {
 	return sb.String()
 }
 
+// sdValueEscaper 是预编译的 SD-PARAM 值转义器。strings.Replacer 构建
+// 时会编译内部的匹配结构，且文档保证其可并发使用——escapeSDValue 位于
+// 每条日志的热路径上，每次调用都 NewReplacer 意味着每条消息的每个
+// SD 参数都重复编译一遍，因此提为包级只编译一次。
+var sdValueEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	`"`, `\"`,
+	`]`, `\]`,
+)
+
 // escapeSDValue 按 RFC 5424 第 6.3.3 节转义 SD-PARAM 的值。
 func escapeSDValue(s string) string {
-	r := strings.NewReplacer(
-		`\`, `\\`,
-		`"`, `\"`,
-		`]`, `\]`,
-	)
-	return r.Replace(s)
+	return sdValueEscaper.Replace(s)
 }
 
 // clamp 把 v 限制在 [min, max] 区间内。
